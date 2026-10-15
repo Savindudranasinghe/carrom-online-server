@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Carrom Online Prototype</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#151515;color:#fff;font-family:Arial,sans-serif;display:flex;justify-content:center}
+.wrap{width:min(760px,100vw);padding:14px}
+h1{font-size:22px;margin:4px 0 10px}.bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+button{border:0;border-radius:8px;padding:9px 13px;font-weight:700;background:#eee;color:#111;cursor:pointer}
+button.active{background:#d8a43b;color:#fff}
+#status{font-size:14px;margin:8px 0;color:#ddd}
+canvas{width:100%;aspect-ratio:1/1;border-radius:10px;display:block;background:#d7b27b;touch-action:none}
+.note{font-size:12px;color:#aaa;margin-top:8px;line-height:1.4}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>CARROM — Break Setup & Shooting Prototype</h1>
+<div class="bar">
+<button id="rotL">↶ Rotate</button>
+<button id="rotR">Rotate ↷</button>
+<button id="reset">Reset Formation</button>
+<button id="breakBtn">🔒 Lock & Break</button>
+</div>
+<div id="status">Break setup: rotate the complete center formation, then press Lock & Break.</div>
+<div id="hud" style="display:flex;gap:12px;flex-wrap:wrap;font-size:13px;margin:7px 0;color:#ddd">
+<span>⏱️ <b id="timer">15</b>s</span><span>Board <b id="boardNo">1</b>/8</span>
+<span>Game <b id="gameNo">1</b>/3</span><span>Queen: <b id="queenState">Open</b></span>
+<span>Mode: <b id="mode">1v1</b></span>
+</div>
+<div class="bar">
+<button id="singles" class="active">1v1 Singles</button>
+<button id="doubles">2v2 Doubles</button>
+<button id="nextBoard">Next Board</button>
+</div>
+
+<div id="lobby" style="display:block;background:#202020;border:1px solid #444;border-radius:10px;padding:12px;margin:10px 0">
+  <div style="font-weight:700;margin-bottom:8px">🌐 ONLINE LOBBY</div>
+  <div class="bar">
+    <button id="createRoom">Create Room</button>
+    <input id="roomCode" maxlength="6" placeholder="Room code" style="padding:9px;border-radius:8px;border:0;width:120px;text-transform:uppercase">
+    <button id="joinRoom">Join Room</button>
+  </div>
+  <div id="roomInfo" style="font-size:13px;color:#ccc;margin:6px 0">No room connected.</div>
+  <div id="players" style="font-size:13px;line-height:1.6">Player 1: —<br>Player 2: —<br>Player 3: —<br>Player 4: —</div>
+  <div class="bar" style="margin-top:8px">
+    <button id="readyBtn">Ready</button>
+    <button id="leaveBtn">Leave Room</button>
+  </div>
+  <div id="network" style="font-size:12px;color:#aaa">Connecting to online server…</div>
+</div>
+<canvas id="c" width="720" height="720"></canvas>
+<div class="note">Prototype: drag the striker to aim, then drag from the striker toward your target and release to shoot. Formation rotation is available only before the break.</div>
+</div>
+<script>
+const c=document.getElementById('c'),ctx=c.getContext('2d');
+const W=720, cx=360, cy=360, R=27;
+let angle=0, locked=false, shotStarted=false, aim={x:cx,y:cy+245}, power=0;
+let coins=[], score={you:0,opp:0}, turn='you', queenCovered=false, shotNo=0, moving=false;
+let mode='1v1', boardNo=1, gameNo=1, timer=15, timerId=null, gameScore={you:0,opp:0};
+let doublesTurn=0;
+let room=null, ready=false, players=[null,null,null,null], localPlayer=0, ws=null, serverState=null, myName="Player";
+let striker={x:cx,y:cy+245,vx:0,vy:0,r:21,p:true};
+const layout=[
+[0,0,'q'],
+[-R*1.73,0,'w'],[R*1.73,0,'b'],
+[-R*.86,-R*1.5,'b'],[R*.86,-R*1.5,'w'],
+[-R*.86,R*1.5,'w'],[R*.86,R*1.5,'b'],
+[-R*1.73,-R*3,'w'],[0,-R*3,'b'],[R*1.73,-R*3,'w'],
+[-R*1.73,R*3,'b'],[0,R*3,'w'],[R*1.73,R*3,'b'],
+[-R*3.46,0,'b'],[R*3.46,0,'w'],
+[-R*2.6,-R*1.5,'w'],[R*2.6,-R*1.5,'b'],
+[-R*2.6,R*1.5,'b'],[R*2.6,R*1.5,'w']
+];
+
+function makeRoomCode(){
+  const chars='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  return Array.from({length:6},()=>chars[Math.floor(Math.random()*chars.length)]).join('');
+}
+function renderLobby(){
+  const info=document.getElementById('roomInfo');
+  const list=document.getElementById('players');
+  info.textContent=room?('Room: '+room+' • '+(mode==='2v2'?'2v2':'1v1')):'No room connected.';
+  list.innerHTML=players.map((x,i)=>'Player '+(i+1)+': '+(x||'—')+(x&&i===localPlayer?' (You)':'')).join('<br>');
+  document.getElementById('readyBtn').textContent=ready?'Unready':'Ready';
+}
+function serverUrl(){
+  if(location.protocol==='https:') return 'wss://'+location.host;
+  if(location.protocol==='http:') return 'ws://'+location.host;
+  return 'ws://'+location.hostname+':8080';
+}
+function connectWS(){
+  if(ws && ws.readyState<=1)return;
+  try{
+    ws=new WebSocket(serverUrl());
+    ws.onopen=()=>document.getElementById('network').textContent='🟢 Online server connected';
+    ws.onclose=()=>document.getElementById('network').textContent='🔴 Server disconnected — reconnect to continue.';
+    ws.onerror=()=>document.getElementById('network').textContent='⚠️ Cannot connect to server';
+    ws.onmessage=e=>{
+      let m;try{m=JSON.parse(e.data)}catch{return}
+      if(m.type==='created'||m.type==='joined'){room=m.room;document.getElementById('roomCode').value=room;renderLobby();}
+      if(m.type==='room_state'){
+        room=m.room; mode=m.mode; players=m.players.map(p=>p?p.name:null);
+        const mine=m.players.findIndex(p=>p&&p.name===myName); if(mine>=0)localPlayer=mine;
+        renderLobby();
+      }
+      if(m.type==='break_locked'){serverState=m.state; angle=serverState.formationAngle||0;locked=true;startTimer();draw();}
+      if(m.type==='shot_resolved'){serverState=m.state;applyServerState(serverState);}
+      if(m.type==='state_sync'){serverState=m.state; if(serverState)applyServerState(serverState);}
+      if(m.type==='error')document.getElementById('network').textContent='⚠️ '+m.message;
+    };
+  }catch(e){document.getElementById('network').textContent='⚠️ WebSocket unavailable';}
+}
+function send(m){if(ws&&ws.readyState===1)ws.send(JSON.stringify(m));else document.getElementById('network').textContent='⚠️ Not connected to server';}
+function createRoom(){
+  myName=(prompt('Your name','Player')||'Player').slice(0,20); connectWS();
+  setTimeout(()=>send({type:'create',mode,name:myName}),150);
+}
+function joinRoom(){
+  const v=document.getElementById('roomCode').value.trim().toUpperCase();
+  if(!/^[A-Z0-9]{6}$/.test(v)){document.getElementById('network').textContent='Enter a 6-character room code.';return}
+  myName=(prompt('Your name','Player')||'Player').slice(0,20); connectWS();
+  setTimeout(()=>send({type:'join',room:v,name:myName}),150);
+}
+function toggleReady(){
+  if(!room){document.getElementById('network').textContent='Create or join a room first.';return}
+  ready=!ready; send({type:'ready',ready}); renderLobby();
+}
+function leaveRoom(){try{if(ws)ws.close()}catch{} room=null;ready=false;players=[null,null,null,null];renderLobby();}
+function applyServerState(st){
+  if(st.mode)mode=st.mode; boardNo=st.board||1;gameNo=st.game||1;queenCovered=st.queen?.status==='covered';
+  if(Array.isArray(st.coins))coins=st.coins.map(p=>({x:p.x,y:p.y,t:p.type,vx:p.vx||0,vy:p.vy||0,r:p.r||17,p:!p.pocketed}));
+  if(st.striker)striker={...striker,x:st.striker.x,y:st.striker.y,p:!st.striker.pocketed};
+  turn=(st.turn===localPlayer)?'you':'opp'; updateHUD(); draw();
+}
+function reset(){
+ angle=0;locked=false;shotStarted=false;moving=false;turn='you';score={you:0,opp:0};queenCovered=false;shotNo=0;
+ boardNo=1;gameNo=1;gameScore={you:0,opp:0};doublesTurn=0;stopTimer();timer=15;
+ coins=layout.map(([x,y,t])=>({x:cx+x,y:cy+y,t,vx:0,vy:0,r:17,p:true}));
+ striker={x:cx,y:cy+245,vx:0,vy:0,r:21,p:true};
+ document.getElementById('status').textContent='Break setup: rotate the complete center formation, then press Lock & Break.';
+}
+function rotate(d){if(locked)return;angle=(angle+d+360)%360;draw()}
+function worldPos(x,y){
+ const a=angle*Math.PI/180;
+ return {x:cx+x*Math.cos(a)-y*Math.sin(a),y:cy+x*Math.sin(a)+y*Math.cos(a)}
+}
+
+function stopTimer(){if(timerId){clearInterval(timerId);timerId=null}}
+function startTimer(){
+  stopTimer(); timer=15; updateHUD();
+  if(!locked)return;
+  timerId=setInterval(()=>{
+    if(moving)return;
+    timer--; updateHUD();
+    if(timer<=0){
+      stopTimer();
+      document.getElementById('status').textContent='15-second limit reached — turn passes.';
+      turn=turn==='you'?'opp':'you'; resetShotTimer();
+    }
+  },1000);
+}
+function resetShotTimer(){timer=15;updateHUD();if(locked)startTimer()}
+function updateHUD(){
+  const t=document.getElementById('timer'); if(t)t.textContent=timer;
+  const b=document.getElementById('boardNo');if(b)b.textContent=boardNo;
+  const g=document.getElementById('gameNo');if(g)g.textContent=gameNo;
+  const q=document.getElementById('queenState');if(q)q.textContent=queenCovered?'Covered':'Open';
+  const m=document.getElementById('mode');if(m)m.textContent=mode;
+}
+function nextBoard(){
+  if(moving)return;
+  boardNo++;
+  if(boardNo>8){
+    if(score.you>score.opp)gameScore.you++; else if(score.opp>score.you)gameScore.opp++;
+    gameNo++; boardNo=1; score={you:0,opp:0}; queenCovered=false;
+    if(gameNo>3){gameNo=1;gameScore={you:0,opp:0}}
+  }
+  reset(); locked=true; startTimer();
+  document.getElementById('status').textContent='New board. Break is locked for this prototype; take your shot.';
+  updateHUD();draw();
+}
+function draw(){
+ updateHUD();
+ ctx.clearRect(0,0,W,W);
+ ctx.fillStyle='#9b673d';ctx.fillRect(18,18,684,684);
+ ctx.fillStyle='#d9b67d';ctx.fillRect(35,35,650,650);
+ // red corner circles / pockets
+ [[55,55],[665,55],[55,665],[665,665]].forEach(([x,y])=>{
+   ctx.fillStyle='#111';ctx.beginPath();ctx.arc(x,y,27,0,Math.PI*2);ctx.fill();
+   ctx.strokeStyle='#b33b2f';ctx.lineWidth=5;ctx.beginPath();ctx.arc(x,y,42,0,Math.PI*2);ctx.stroke();
+ });
+ // center markings
+ ctx.strokeStyle='#9c3c31';ctx.lineWidth=4;ctx.beginPath();ctx.arc(cx,cy,75,0,Math.PI*2);ctx.stroke();
+ ctx.beginPath();ctx.arc(cx,cy,19,0,Math.PI*2);ctx.stroke();
+ for(let i=0;i<4;i++){let a=i*Math.PI/2;ctx.beginPath();ctx.moveTo(cx+25*Math.cos(a),cy+25*Math.sin(a));ctx.lineTo(cx+315*Math.cos(a),cy+315*Math.sin(a));ctx.stroke()}
+ // coins
+ coins.forEach(o=>{
+   if(!o.p)return;
+   ctx.beginPath();ctx.arc(o.x,o.y,o.r,0,Math.PI*2);
+   ctx.fillStyle=o.t==='w'?'#eee8d8':o.t==='b'?'#222':'#b52f27';ctx.fill();
+   ctx.strokeStyle='#777';ctx.lineWidth=2;ctx.stroke();
+   ctx.beginPath();ctx.arc(o.x,o.y,o.r-5,0,Math.PI*2);ctx.strokeStyle=o.t==='b'?'#777':'#a49b89';ctx.lineWidth=1;ctx.stroke();
+ });
+ // striker
+ ctx.beginPath();ctx.arc(striker.x,striker.y,21,0,Math.PI*2);ctx.fillStyle='#e9e4d7';ctx.fill();ctx.strokeStyle='#555';ctx.lineWidth=3;ctx.stroke();
+ ctx.beginPath();ctx.arc(striker.x,striker.y,13,0,Math.PI*2);ctx.strokeStyle='#a44';ctx.lineWidth=2;ctx.stroke();
+ ctx.fillStyle='#111';ctx.font='bold 14px Arial';
+ ctx.fillText('You: '+score.you+'   Opp: '+score.opp+'   Turn: '+turn.toUpperCase(),55,695);
+ if(!locked){
+   ctx.fillStyle='rgba(255,255,255,.8)';ctx.font='bold 16px Arial';ctx.fillText('BREAK FORMATION',270,48);
+   ctx.font='14px Arial';ctx.fillText('Rotation: '+Math.round(angle)+'°',300,675);
+ } else {
+   ctx.strokeStyle='rgba(255,255,255,.55)';ctx.lineWidth=2;
+   ctx.beginPath();ctx.moveTo(aim.x,aim.y);ctx.lineTo(aim.x+(aim.x-(shotStarted?aim.x:cx))*0.35,aim.y+(aim.y-(shotStarted?aim.y:cy))*0.35);ctx.stroke();
+ }
+}
+function setAim(x,y){aim.x=Math.max(80,Math.min(640,x));aim.y=Math.max(80,Math.min(640,y));draw()}
+
+function insideBoard(x,y){return x>52&&x<668&&y>52&&y<668}
+function pocket(o){
+  const ps=[[55,55],[665,55],[55,665],[665,665]];
+  return ps.some(([x,y])=>Math.hypot(o.x-x,o.y-y)<30);
+}
+function resolveShot(){
+  let own=0, opp=0, q=false, foul=false, strikerPocket=false;
+  coins.forEach(o=>{
+    if(!o.p)return;
+    if(pocket(o)){
+      o.p=false;
+      if(o.t==='q') q=true;
+      else if((turn==='you'&&o.t==='w')||(turn==='opp'&&o.t==='b')) own++;
+      else opp++;
+    }
+  });
+  if(pocket(striker)){strikerPocket=true;striker.p=false;foul=true}
+  if(strikerPocket){
+    score[turn]+=Math.max(0,own-1);
+    if(q) queenCovered=false;
+    document.getElementById('status').textContent='FOUL: Striker pocketed. Due/penalty applied. Turn changes.';
+  } else if(own>0){
+    score[turn]+=own;
+    if(q){queenCovered=true;score[turn]+=3}
+    document.getElementById('status').textContent='Legal shot: '+own+' own coin(s) pocketed'+(q?' + Queen covered (+3).':'')+'. Shoot again.';
+  } else if(q){
+    // Queen without an own coin is returned to center in this prototype.
+    const qcoin=coins.find(o=>o.t==='q'&&!o.p);
+    if(qcoin){qcoin.p=true;qcoin.x=cx;qcoin.y=cy}
+    document.getElementById('status').textContent='Queen not covered — returned to center. Turn changes.';
+    turn=turn==='you'?'opp':'you';
+  } else {
+    document.getElementById('status').textContent='No own coin pocketed. Turn changes.';
+    turn=turn==='you'?'opp':'you';
+  }
+  striker.p=true; striker.x=cx; striker.y=cy+245; striker.vx=0; striker.vy=0;
+  shotNo++;
+  if(mode==='2v2'){doublesTurn=(doublesTurn+1)%4;turn=(doublesTurn===0||doublesTurn===2)?'you':'opp'}
+  draw(); if(locked)startTimer();
+}
+function animatePhysics(){
+  moving=true;
+  let movingAny=true, frames=0;
+  function tick(){
+    movingAny=false; frames++;
+    const all=[striker,...coins.filter(o=>o.p)];
+    all.forEach(o=>{
+      if(Math.abs(o.vx)+Math.abs(o.vy)<.03){o.vx=o.vy=0;return}
+      o.x+=o.vx;o.y+=o.vy;o.vx*=.985;o.vy*=.985;
+      if(o.x<52+o.r||o.x>668-o.r){o.vx*=-.92;o.x=Math.max(52+o.r,Math.min(668-o.r,o.x))}
+      if(o.y<52+o.r||o.y>668-o.r){o.vy*=-.92;o.y=Math.max(52+o.r,Math.min(668-o.r,o.y))}
+      if(Math.hypot(o.vx,o.vy)>.03)movingAny=true;
+    });
+    // elastic coin/striker collisions
+    for(let i=0;i<all.length;i++)for(let j=i+1;j<all.length;j++){
+      const a=all[i],b=all[j],dx=b.x-a.x,dy=b.y-a.y,d=Math.hypot(dx,dy),min=a.r+b.r;
+      if(d>0&&d<min){
+        const nx=dx/d,ny=dy/d,over=min-d;
+        a.x-=nx*over/2;a.y-=ny*over/2;b.x+=nx*over/2;b.y+=ny*over/2;
+        const rvx=b.vx-a.vx,rvy=b.vy-a.vy,rel=rvx*nx+rvy*ny;
+        if(rel<0){const imp=-rel; a.vx-=nx*imp;a.vy-=ny*imp;b.vx+=nx*imp;b.vy+=ny*imp}
+      }
+    }
+    draw();
+    if(movingAny&&frames<900)requestAnimationFrame(tick);
+    else {moving=false;resolveShot()}
+  }
+  tick();
+}
+c.addEventListener('pointerdown',e=>{
+ if(!locked||moving)return;
+ const r=c.getBoundingClientRect(),x=(e.clientX-r.left)*W/r.width,y=(e.clientY-r.top)*W/r.height;
+ if(Math.hypot(x-striker.x,y-striker.y)<45){shotStarted=true;c.setPointerCapture(e.pointerId)}
+});
+c.addEventListener('pointermove',e=>{
+ if(!shotStarted)return;
+ const r=c.getBoundingClientRect(),x=(e.clientX-r.left)*W/r.width,y=(e.clientY-r.top)*W/r.height;
+ aim.x=x;aim.y=y;power=Math.min(2.4,Math.hypot(x-striker.x,y-striker.y)/100);draw();
+});
+c.addEventListener('pointerup',e=>{
+ if(!shotStarted)return;shotStarted=false;
+ const r=c.getBoundingClientRect(),x=(e.clientX-r.left)*W/r.width,y=(e.clientY-r.top)*W/r.height;
+ const dx=striker.x-x,dy=striker.y-y,len=Math.hypot(dx,dy)||1;
+ if(ws&&ws.readyState===1){ send({type:'shot_intent',x,y,power}); return; }
+ striker.vx=dx/len*18*power;striker.vy=dy/len*18*power;
+ animatePhysics();
+});
+document.getElementById('createRoom').onclick=createRoom;
+document.getElementById('joinRoom').onclick=joinRoom;
+document.getElementById('readyBtn').onclick=toggleReady;
+document.getElementById('leaveBtn').onclick=leaveRoom;
+document.getElementById('singles').onclick=()=>{mode='1v1';document.getElementById('singles').classList.add('active');document.getElementById('doubles').classList.remove('active');updateHUD()};
+document.getElementById('doubles').onclick=()=>{mode='2v2';document.getElementById('doubles').classList.add('active');document.getElementById('singles').classList.remove('active');updateHUD();renderLobby()};
+document.getElementById('nextBoard').onclick=nextBoard;
+document.getElementById('rotL').onclick=()=>rotate(-5);
+document.getElementById('rotR').onclick=()=>rotate(5);
+document.getElementById('reset').onclick=reset;
+document.getElementById('breakBtn').onclick=()=>{
+ if(locked)return;
+ if(room){ send({type:'break_lock',angle}); }
+ else { locked=true; startTimer(); }
+ document.getElementById('status').textContent='Break locked. Aim and shoot the striker. Formation rotation is now disabled.';
+ draw();
+};
+reset(); renderLobby(); connectWS();
+</script>
+</body>
+</html>
